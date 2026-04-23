@@ -1,0 +1,8 @@
+output
+notebooks
+ckpts
+.venv
+
+__pycache__
+*.log
+*.pt
