@@ -305,43 +305,45 @@ class WorldModelGame:
 
         P = dict(padx=12)
         tk.Label(sidebar, text="World Model", bg=PANEL, fg=BRIGHT,
-                 font=('Arial', 11, 'bold')).pack(anchor='w', pady=(14, 0), **P)
+                font=('Arial', 11, 'bold')).pack(anchor='w', pady=(14, 0), **P)
 
         self._sep(sidebar)
-        self._btn(sidebar, "Load Image", self._load_start_image).pack(fill='x', pady=10, **P)
+        self.load_btn = self._btn(sidebar, "Load Image", self._load_start_image)
+        self.load_btn.configure(state='disabled')
+        self.load_btn.pack(fill='x', pady=10, **P)
 
         self.rec_btn = self._btn(sidebar, "⏺ Start Recording", self._toggle_recording, color=ACCENT)
         self.rec_btn.pack(fill='x', pady=5, **P)
 
         self._sep(sidebar)
         tk.Label(sidebar, text="Movement intensity",
-                 bg=PANEL, fg=DIM, font=('Arial', 9)).pack(anchor='w', pady=(8, 0), **P)
+                bg=PANEL, fg=DIM, font=('Arial', 9)).pack(anchor='w', pady=(8, 0), **P)
         self.intensity_var = tk.DoubleVar(value=1.0)
         tk.Scale(sidebar, from_=0.1, to=5.0, resolution=0.1,
-                 orient='horizontal', variable=self.intensity_var,
-                 command=lambda v: setattr(self, 'intensity', float(v)),
-                 bg=PANEL, fg=BRIGHT, troughcolor=CARD,
-                 highlightthickness=0, activebackground=ACCENT,
-                 bd=0, length=SIDEBAR_W - 24).pack(**P)
+                orient='horizontal', variable=self.intensity_var,
+                command=lambda v: setattr(self, 'intensity', float(v)),
+                bg=PANEL, fg=BRIGHT, troughcolor=CARD,
+                highlightthickness=0, activebackground=ACCENT,
+                bd=0, length=SIDEBAR_W - 24).pack(**P)
 
         tk.Label(sidebar, text="Step interval (ms)",
-                 bg=PANEL, fg=DIM, font=('Arial', 9)).pack(anchor='w', pady=(6, 0), **P)
+                bg=PANEL, fg=DIM, font=('Arial', 9)).pack(anchor='w', pady=(6, 0), **P)
         self.tick_var = tk.IntVar(value=self.tick_interval)
         tk.Scale(sidebar, from_=50, to=1000, resolution=50,
-                 orient='horizontal', variable=self.tick_var,
-                 command=lambda v: setattr(self, 'tick_interval', int(float(v))),
-                 bg=PANEL, fg=BRIGHT, troughcolor=CARD,
-                 highlightthickness=0, activebackground=ACCENT,
-                 bd=0, length=SIDEBAR_W - 24).pack(**P)
+                orient='horizontal', variable=self.tick_var,
+                command=lambda v: setattr(self, 'tick_interval', int(float(v))),
+                bg=PANEL, fg=BRIGHT, troughcolor=CARD,
+                highlightthickness=0, activebackground=ACCENT,
+                bd=0, length=SIDEBAR_W - 24).pack(**P)
 
         self._sep(sidebar)
         tk.Label(sidebar, text="D-pad", bg=PANEL, fg=DIM,
-                 font=('Arial', 9)).pack(anchor='w', pady=(8, 6), **P)
+                font=('Arial', 9)).pack(anchor='w', pady=(8, 6), **P)
         self._build_dpad(sidebar)
 
         self._sep(sidebar)
         tk.Label(sidebar, text="Stats", bg=PANEL, fg=DIM,
-                 font=('Arial', 9)).pack(anchor='w', pady=(8, 4), **P)
+                font=('Arial', 9)).pack(anchor='w', pady=(8, 4), **P)
         self.stat_steps = self._stat(sidebar, "Steps")
         self.stat_fps   = self._stat(sidebar, "FPS")
 
@@ -522,6 +524,7 @@ class WorldModelGame:
             self.predictor.eval()
             self.decoder.eval()
             self._status("Ready — load a starting image")
+            self.root.after(0, lambda: self.load_btn.configure(state='normal'))
 
         threading.Thread(target=_load, daemon=True).start()
 
