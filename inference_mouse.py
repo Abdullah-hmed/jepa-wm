@@ -26,7 +26,7 @@ DY_SCALE   = 333.33
 
 WIN_W      = 900
 WIN_H      = 600
-VIEW_SIZE  = 512   # square viewport
+VIEW_SIZE  = 512
 
 # =====================================================================
 # PREDICTOR
@@ -231,11 +231,10 @@ def encode_and_pool(encoder, pil_img, device):
 
 
 # =====================================================================
-# PYGAME APP
+# HELPERS
 # =====================================================================
 
 def pick_image():
-    """Open file dialog on a hidden tkinter root."""
     root = Tk()
     root.withdraw()
     root.attributes('-topmost', True)
@@ -245,22 +244,22 @@ def pick_image():
     root.destroy()
     return path
 
-
 def pil_to_pygame(pil_img, size):
     pil_img = pil_img.resize(size, Image.Resampling.BILINEAR)
     return pygame.image.fromstring(pil_img.tobytes(), pil_img.size, 'RGB')
 
 
+# =====================================================================
+# MAIN
+# =====================================================================
+
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # ── Load models ────────────────────────────────────────
     print("[Status] Loading V-JEPA 2.1 encoder…")
     encoder = load_vjepa21_encoder()
-
     print("[Status] Loading predictor…")
     predictor = ACPredictor().to(device).half()
-
     print("[Status] Loading decoder…")
     decoder = FrameDecoder().to(device).half()
 
@@ -281,19 +280,14 @@ def main():
     decoder.eval()
     print("[Status] Ready")
 
-    # ── Pygame setup ───────────────────────────────────────
+    # ── Pygame init ────────────────────────────────────────
     pygame.init()
-    screen = pygame.display.set_mode((WIN_W, WIN_H))
+    screen     = pygame.display.set_mode((WIN_W, WIN_H), pygame.RESIZABLE)
+    fullscreen = False
     pygame.display.set_caption("World Model Explorer")
     clock  = pygame.time.Clock()
     font_l = pygame.font.SysFont('Arial', 15)
     font_s = pygame.font.SysFont('Arial', 12)
-
-    # Layout
-    VIEW_X = 20
-    VIEW_Y = (WIN_H - VIEW_SIZE) // 2
-    PANEL_X = VIEW_X + VIEW_SIZE + 20
-    PANEL_W = WIN_W - PANEL_X - 20
 
     # Colors
     C_BG     = (17,  17,  17)
@@ -303,12 +297,12 @@ def main():
     C_DIM    = (100, 100, 100)
     C_BRIGHT = (220, 220, 220)
     C_DANGER = (200,  68,  68)
-    C_GREEN  = ( 68, 200, 136)
 
     # State
     latent_history  = None
     current_surface = None
     mouse_captured  = False
+    w_held          = False
     sensitivity     = 1.0
     step_count      = 0
     fps_inf         = 0.0
@@ -319,26 +313,26 @@ def main():
 
     def do_step(dx, dy):
         nonlocal latent_history, current_surface, step_count, fps_inf, inferring
-
         if latent_history is None or inferring:
             return
         inferring = True
         t0 = time.time()
-
         action = torch.tensor(
             [[dx * DX_SCALE, dy * DY_SCALE]],
             dtype=torch.float16, device=device
         ).unsqueeze(1)
-
         with torch.no_grad():
             nxt = predictor(latent_history[:, -1:], action)
+            if latent_history is None:   # check again after inference in case reset happened mid-flight
+                inferring = False
+                return
             latent_history = torch.cat([latent_history, nxt], dim=1)[:, -MAX_SEQ:]
             recon = decoder(nxt.squeeze(1))
-
         fps_inf = 1.0 / max(time.time() - t0, 1e-6)
         img_np  = recon.squeeze(0).cpu().clamp(0, 1).permute(1, 2, 0).float().numpy()
         pil     = Image.fromarray((img_np * 255).astype(np.uint8))
-        current_surface = pil_to_pygame(pil, (VIEW_SIZE, VIEW_SIZE))
+        vs = get_view_size()
+        current_surface = pil_to_pygame(pil, (vs, vs))
         step_count += 1
         inferring = False
 
@@ -353,22 +347,34 @@ def main():
         seed_emb = encode_and_pool(encoder, img, device)
         encoder.to('cpu')
         torch.cuda.empty_cache()
-        latent_history  = seed_emb.unsqueeze(1)
-        step_count      = 0
-        preview_pil     = img.copy()
-        preview_pil.thumbnail((VIEW_SIZE, VIEW_SIZE), Image.Resampling.LANCZOS)
-        canvas = Image.new('RGB', (VIEW_SIZE, VIEW_SIZE), (10, 10, 10))
-        canvas.paste(preview_pil, (
-            (VIEW_SIZE - preview_pil.width)  // 2,
-            (VIEW_SIZE - preview_pil.height) // 2,
+        latent_history = seed_emb.unsqueeze(1)
+        step_count     = 0
+        vs = get_view_size()
+        preview = img.copy()
+        preview.thumbnail((vs, vs), Image.Resampling.LANCZOS)
+        canvas = Image.new('RGB', (vs, vs), (10, 10, 10))
+        canvas.paste(preview, (
+            (vs - preview.width)  // 2,
+            (vs - preview.height) // 2,
         ))
-        current_surface = pil_to_pygame(canvas, (VIEW_SIZE, VIEW_SIZE))
+        current_surface = pil_to_pygame(canvas, (vs, vs))
         status_msg = "Click viewport to capture mouse"
 
+    def get_view_size():
+        w, h = screen.get_size()
+        return min(h - 40, w - 260)
+
+    def get_layout():
+        w, h   = screen.get_size()
+        vs     = get_view_size()
+        view_x = 20
+        view_y = (h - vs) // 2
+        panel_x = view_x + vs + 20
+        panel_w = w - panel_x - 20
+        return vs, view_x, view_y, panel_x, panel_w, w, h
+
     def draw_text(surf, text, x, y, color=None, font=None):
-        color = color or C_BRIGHT
-        font  = font  or font_l
-        surf.blit(font.render(text, True, color), (x, y))
+        surf.blit((font or font_l).render(text, True, color or C_BRIGHT), (x, y))
 
     def draw_button(surf, rect, label, color=C_ACCENT):
         pygame.draw.rect(surf, C_CARD, rect, border_radius=6)
@@ -377,29 +383,40 @@ def main():
                   rect[0] + (rect[2] - tw) // 2,
                   rect[1] + (rect[3] - th) // 2,
                   color=color)
-        return pygame.Rect(rect)
-
-    # Button rects
-    btn_load  = (PANEL_X, 60,  PANEL_W, 34)
-    btn_reset = (PANEL_X, 102, PANEL_W, 34)
 
     running = True
     while running:
-        dt = clock.tick(30)
+        clock.tick(30)
+        vs, view_x, view_y, panel_x, panel_w, sw, sh = get_layout()
 
-        # ── Events ─────────────────────────────────────────
+        btn_load  = (panel_x, 60,  panel_w, 34)
+        btn_reset = (panel_x, 102, panel_w, 34)
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    if mouse_captured:
+                    if fullscreen:
+                        fullscreen = False
+                        screen = pygame.display.set_mode(
+                            (WIN_W, WIN_H), pygame.RESIZABLE)
+                    elif mouse_captured:
                         pygame.mouse.set_visible(True)
                         pygame.event.set_grab(False)
                         mouse_captured = False
                         pending_dx = pending_dy = 0.0
                         status_msg = "Mouse released"
+
+                elif event.key == pygame.K_F11:
+                    fullscreen = not fullscreen
+                    if fullscreen:
+                        screen = pygame.display.set_mode(
+                            (0, 0), pygame.FULLSCREEN)
+                    else:
+                        screen = pygame.display.set_mode(
+                            (WIN_W, WIN_H), pygame.RESIZABLE)
 
                 elif event.key == pygame.K_l:
                     threading.Thread(target=load_image, daemon=True).start()
@@ -415,33 +432,29 @@ def main():
                     status_msg = "Session reset"
 
                 elif event.key == pygame.K_w:
-                    if latent_history is not None:
-                        threading.Thread(
-                            target=do_step, args=(0.0, 0.0), daemon=True
-                        ).start()
+                    w_held = True
 
-                elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
-                    sensitivity = min(5.0, sensitivity + 0.1)
+                elif event.key in (pygame.K_EQUALS, pygame.K_PLUS):
+                    sensitivity = min(5.0, round(sensitivity + 0.1, 1))
                 elif event.key == pygame.K_MINUS:
-                    sensitivity = max(0.1, sensitivity - 0.1)
+                    sensitivity = max(0.1, round(sensitivity - 0.1, 1))
+
+            elif event.type == pygame.KEYUP:
+                if event.key == pygame.K_w:
+                    w_held = False
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
-                    mx, my = event.pos
-                    vr = pygame.Rect(VIEW_X, VIEW_Y, VIEW_SIZE, VIEW_SIZE)
-                    br_load  = pygame.Rect(btn_load)
-                    br_reset = pygame.Rect(btn_reset)
-
+                    mx, my  = event.pos
+                    vr      = pygame.Rect(view_x, view_y, vs, vs)
                     if vr.collidepoint(mx, my) and latent_history is not None:
                         pygame.mouse.set_visible(False)
                         pygame.event.set_grab(True)
                         mouse_captured = True
                         status_msg = "Mouse captured — ESC to release"
-
-                    elif br_load.collidepoint(mx, my):
+                    elif pygame.Rect(btn_load).collidepoint(mx, my):
                         threading.Thread(target=load_image, daemon=True).start()
-
-                    elif br_reset.collidepoint(mx, my):
+                    elif pygame.Rect(btn_reset).collidepoint(mx, my):
                         latent_history  = None
                         current_surface = None
                         step_count      = 0
@@ -453,87 +466,99 @@ def main():
 
             elif event.type == pygame.MOUSEMOTION:
                 if mouse_captured:
-                    # pygame relative mode gives exact per-frame deltas
                     rel_x, rel_y = event.rel
                     pending_dx += rel_x * sensitivity * 0.01
                     pending_dy += rel_y * sensitivity * 0.01
                     pending_dx  = max(-1.0, min(1.0, pending_dx))
                     pending_dy  = max(-1.0, min(1.0, pending_dy))
 
-        # ── Dispatch accumulated mouse delta ───────────────
-        if (mouse_captured and latent_history is not None and not inferring and
-                (abs(pending_dx) > 0.001 or abs(pending_dy) > 0.001)):
-            dx, dy     = pending_dx, pending_dy
-            pending_dx = 0.0
-            pending_dy = 0.0
-            threading.Thread(target=do_step, args=(dx, dy), daemon=True).start()
+            elif event.type == pygame.VIDEORESIZE:
+                if not fullscreen:
+                    screen = pygame.display.set_mode(
+                        (event.w, event.h), pygame.RESIZABLE)
+
+        # ── Dispatch ───────────────────────────────────────
+        if latent_history is not None and not inferring:
+            if w_held:
+                threading.Thread(
+                    target=do_step, args=(0.0, 0.0), daemon=True).start()
+            elif mouse_captured and (
+                abs(pending_dx) > 0.001 or abs(pending_dy) > 0.001
+            ):
+                dx, dy     = pending_dx, pending_dy
+                pending_dx = 0.0
+                pending_dy = 0.0
+                threading.Thread(
+                    target=do_step, args=(dx, dy), daemon=True).start()
 
         # ── Draw ───────────────────────────────────────────
         screen.fill(C_BG)
 
         # Viewport
-        view_rect = pygame.Rect(VIEW_X, VIEW_Y, VIEW_SIZE, VIEW_SIZE)
-        pygame.draw.rect(screen, C_PANEL, view_rect)
+        vr = pygame.Rect(view_x, view_y, vs, vs)
+        pygame.draw.rect(screen, C_PANEL, vr)
         if current_surface:
-            screen.blit(current_surface, (VIEW_X, VIEW_Y))
+            scaled = pygame.transform.scale(current_surface, (vs, vs))
+            screen.blit(scaled, (view_x, view_y))
         else:
             msg = font_l.render("Press L to load image", True, C_DIM)
             screen.blit(msg, (
-                VIEW_X + (VIEW_SIZE - msg.get_width())  // 2,
-                VIEW_Y + (VIEW_SIZE - msg.get_height()) // 2,
+                view_x + (vs - msg.get_width())  // 2,
+                view_y + (vs - msg.get_height()) // 2,
             ))
         pygame.draw.rect(screen, C_ACCENT if mouse_captured else C_DIM,
-                         view_rect, 2, border_radius=4)
+                         vr, 2, border_radius=4)
 
         # Capture indicator
         if mouse_captured:
             ind = font_s.render("● CAPTURED  |  ESC to release", True, C_ACCENT)
-            screen.blit(ind, (VIEW_X + 8, VIEW_Y + 8))
+            screen.blit(ind, (view_x + 8, view_y + 8))
 
-        # Panel
+        # Panel background
         pygame.draw.rect(screen, C_PANEL,
-                         (PANEL_X - 10, 0, WIN_W - PANEL_X + 10, WIN_H))
+                         (panel_x - 10, 0, sw - panel_x + 10, sh))
 
-        draw_text(screen, "World Model", PANEL_X, 20, C_BRIGHT)
-        draw_text(screen, "Mouse-driven inference", PANEL_X, 40, C_DIM, font_s)
+        draw_text(screen, "World Model",          panel_x, 20, C_BRIGHT)
+        draw_text(screen, "Mouse-driven inference", panel_x, 38, C_DIM, font_s)
 
         draw_button(screen, btn_load,  "📂  Load Image  (L)")
         draw_button(screen, btn_reset, "↺  Reset  (R)", color=C_DANGER)
 
         # Sensitivity
         draw_text(screen, f"Sensitivity: {sensitivity:.1f}  (+/- to adjust)",
-                  PANEL_X, 155, C_DIM, font_s)
-        bar_w = int(PANEL_W * (sensitivity / 5.0))
-        pygame.draw.rect(screen, C_CARD,   (PANEL_X, 172, PANEL_W, 8), border_radius=4)
-        pygame.draw.rect(screen, C_ACCENT, (PANEL_X, 172, bar_w,   8), border_radius=4)
+                  panel_x, 155, C_DIM, font_s)
+        bar_w = int(panel_w * (sensitivity / 5.0))
+        pygame.draw.rect(screen, C_CARD,   (panel_x, 172, panel_w, 8), border_radius=4)
+        pygame.draw.rect(screen, C_ACCENT, (panel_x, 172, bar_w,   8), border_radius=4)
 
         # Controls
-        draw_text(screen, "Controls", PANEL_X, 200, C_DIM)
+        draw_text(screen, "Controls", panel_x, 200, C_DIM)
         for i, line in enumerate([
             "Click viewport  → capture mouse",
-            "ESC             → release mouse",
-            "W               → step forward",
+            "ESC             → release / exit fullscreen",
+            "W  (hold)       → step forward",
             "Mouse move      → look / steer",
             "L               → load image",
             "R               → reset session",
             "+/-             → sensitivity",
+            "F11             → toggle fullscreen",
         ]):
-            draw_text(screen, line, PANEL_X, 222 + i * 18, C_DIM, font_s)
+            draw_text(screen, line, panel_x, 220 + i * 18, C_DIM, font_s)
 
-        # Stats
-        draw_text(screen, "Stats", PANEL_X, 360, C_DIM)
+        draw_text(screen, "Stats", panel_x, 380, C_DIM)
         for i, (label, val) in enumerate([
-            ("Steps",  str(step_count)),
+            ("Steps",   str(step_count)),
             ("Inf FPS", f"{fps_inf:.1f}" if fps_inf > 0 else "—"),
-            ("dx",     f"{pending_dx:+.3f}"),
-            ("dy",     f"{pending_dy:+.3f}"),
-            ("Device", device.upper()),
+            ("dx",      f"{pending_dx:+.3f}"),
+            ("dy",      f"{pending_dy:+.3f}"),
+            ("Device",  device.upper()),
         ]):
-            draw_text(screen, f"{label:<10}{val}", PANEL_X, 382 + i * 18, C_BRIGHT, font_s)
+            draw_text(screen, f"{label:<10}{val}",
+                      panel_x, 398 + i * 18, C_BRIGHT, font_s)
 
         # Status bar
-        pygame.draw.rect(screen, C_CARD, (0, WIN_H - 28, WIN_W, 28))
-        draw_text(screen, status_msg, 12, WIN_H - 20, C_DIM, font_s)
+        pygame.draw.rect(screen, C_CARD, (0, sh - 28, sw, 28))
+        draw_text(screen, status_msg, 12, sh - 20, C_DIM, font_s)
 
         pygame.display.flip()
 
