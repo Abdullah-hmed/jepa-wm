@@ -1,29 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# paste your ACPredictor class here, or import it
 
-PRED_DEPTH = 48
-SEQ_LEN    = 32
-MAX_SEQ    = 32
-
+# =====================================================================
+# CONFIGURATION (12x12 Pooled Variant)
+# =====================================================================
+PRED_DEPTH = 20
+SEQ_LEN    = 24
+MAX_SEQ    = 48
 
 ENC_DIM     = 1024
-N_PATCHES   = 256
-PATCH_H     = 16
-PATCH_W     = 16
+N_PATCHES   = 144   # 12 * 12
+PATCH_H     = 12
+PATCH_W     = 12
 PRED_DIM    = 1024
 PRED_HEADS  = 16
 ACTION_DIM  = 2
 
-
-print("PRED_DEPTH:", PRED_DEPTH)
-print("SEQ_LEN:", SEQ_LEN)
-print("MAX_SEQ:", MAX_SEQ)
-
-# =====================================================================
-# PREDICTOR
-# =====================================================================
+print(f"Config: {PATCH_H}x{PATCH_W} grid | {N_PATCHES} patches | Depth {PRED_DEPTH}")
 
 def get_1d_sincos(embed_dim, pos):
     assert embed_dim % 2 == 0
@@ -110,6 +104,7 @@ class ACPredictor(nn.Module):
             nn.Linear(256, pred_dim), nn.LayerNorm(pred_dim)
         )
 
+        # Correctly builds PE for the 12x12 grid
         spatial_pe = build_2d_sincos_pe(pred_dim, patch_h, patch_w)
         self.register_buffer('spatial_pe', spatial_pe.unsqueeze(0))
         self.temporal_emb = nn.Embedding(max_seq, pred_dim)
@@ -151,11 +146,6 @@ class ACPredictor(nn.Module):
             seq = block(seq, a_emb, attn_mask=mask)
         return self.out_proj(self.norm(seq).view(B, T, N, self.pred_dim))
 
-
-# =====================================================================
-# DECODER
-# =====================================================================
-
 class UpsamplingBlock(nn.Module):
     def __init__(self, in_ch, out_ch, dropout=0.1):
         super().__init__()
@@ -171,41 +161,56 @@ class UpsamplingBlock(nn.Module):
     def forward(self, x): return self.net(x)
 
 class FrameDecoder(nn.Module):
-    GRID_H = GRID_W = 16
-    def __init__(self, emb_dim=1024, tokens=256):
+    # Updated for the 12x12 grid
+    GRID_H = GRID_W = 12  
+    def __init__(self, emb_dim=1024):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Conv2d(emb_dim, 512, kernel_size=1), nn.GroupNorm(32, 512), nn.GELU()
         )
+        # We need an extra upsampling stage or larger scale factor to get 
+        # back to original resolution if starting from 12x12.
+        # This keeps the blocks but adds one more to reach standard sizes.
         self.up = nn.ModuleList([
-            UpsamplingBlock(512, 512),
-            UpsamplingBlock(512, 256),
-            UpsamplingBlock(256, 128),
-            UpsamplingBlock(128,  64),
+            UpsamplingBlock(512, 512), # 12 -> 24
+            UpsamplingBlock(512, 256), # 24 -> 48
+            UpsamplingBlock(256, 128), # 48 -> 96
+            UpsamplingBlock(128,  64), # 96 -> 192
+            UpsamplingBlock(64,   32), # 192 -> 384 (optional, depending on target)
         ])
         self.to_rgb = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1), nn.GELU(),
-            nn.Conv2d(32,  3, kernel_size=3, padding=1), nn.Sigmoid(),
+            nn.Conv2d(32, 3, kernel_size=3, padding=1), nn.Sigmoid(),
         )
 
     def forward(self, x):
         B = x.shape[0]
+        # x expected as [B, 144, 1024]
         x = x.permute(0, 2, 1).view(B, 1024, self.GRID_H, self.GRID_W)
         x = self.proj(x)
         for block in self.up: x = block(x)
         return self.to_rgb(x)
+
+# =====================================================================
+# EXECUTION
+# =====================================================================
 
 model = ACPredictor(depth=PRED_DEPTH, max_seq=MAX_SEQ).cuda().half()
 decoder = FrameDecoder().cuda().half()
 model.eval()
 decoder.eval()
 
-z = torch.randn(1, 32, 256, 1024, dtype=torch.float16, device='cuda')
-a = torch.randn(1, 32, 2, dtype=torch.float16, device='cuda')
+# Dummy input representing pooled embeddings
+# z = torch.randn(1, 32, 144, 1024, dtype=torch.float16, device='cuda')
+# a = torch.randn(1, 32, 2, dtype=torch.float16, device='cuda')
+
+z = torch.randn(1, 48, 144, 1024, dtype=torch.float16, device='cuda')
+a = torch.randn(1, 48, 2, dtype=torch.float16, device='cuda')
 
 with torch.no_grad():
     out = model(z, a)
+    # Decode the last predicted frame
     frame = decoder(out[:, -1])
 
 peak = torch.cuda.max_memory_allocated() / 1024**2
-print(f"Peak VRAM with decoder: {peak:.0f}MB")
+print(f"Peak VRAM with 12x12 setup: {peak:.0f}MB")
+print(f"Output Frame Shape: {frame.shape}")
