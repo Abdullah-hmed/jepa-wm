@@ -21,8 +21,8 @@ PRED_HEADS = 16
 ACTION_DIM = 2
 MAX_SEQ    = 48
 
-DX_SCALE   = 111.11
-DY_SCALE   = 333.33
+DX_SCALE   = 1
+DY_SCALE   = 1
 
 WIN_W      = 900
 WIN_H      = 600
