@@ -86,12 +86,34 @@ def clear_cache(component: str = None):
 # ─────────────────────────────────────────────────────────────────
 # VJEPA TRANSFORM & UTILS
 # ─────────────────────────────────────────────────────────────────
-vjepa_transform = T.Compose([
-    T.Resize(IMG_SIZE, interpolation=T.InterpolationMode.BICUBIC),  # shorter side → 384
-    T.CenterCrop(IMG_SIZE),                                          # crop longer side minimally
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+# Crop mode is set at runtime via the UI; default is center-crop
+# "center_crop" or "letterbox"
+_current_crop_mode = "center_crop"
+
+def _make_vjepa_transform(crop_mode: str = "center_crop"):
+    """Return a torchvision transform for the chosen crop/pad strategy."""
+    normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    if crop_mode == "letterbox":
+        def letterbox_transform(img: Image.Image) -> torch.Tensor:
+            # Pad to square with black bars, then resize
+            w, h = img.size
+            max_side = max(w, h)
+            padded = Image.new("RGB", (max_side, max_side), (0, 0, 0))
+            padded.paste(img, ((max_side - w) // 2, (max_side - h) // 2))
+            padded = padded.resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC)
+            t = T.ToTensor()(padded)
+            return normalize(t)
+        return letterbox_transform
+    else:
+        transform = T.Compose([
+            T.Resize(IMG_SIZE, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(IMG_SIZE),
+            T.ToTensor(),
+            normalize,
+        ])
+        return transform
+
+vjepa_transform = _make_vjepa_transform("center_crop")
 
 # ─────────────────────────────────────────────────────────────────
 # ADAPTER ARCHITECTURE (must match training exactly)
@@ -201,7 +223,7 @@ def encode_frame(pil_image: Image.Image) -> torch.Tensor:
     # Ensure encoder is on GPU and in correct dtype for inference
     encoder.eval().to(DEVICE)
     
-    x = vjepa_transform(pil_image)  # (3, 384, 384)
+    x = vjepa_transform(pil_image)  # (3, 384, 384)  — crop mode applied via global
     x = x.unsqueeze(0).unsqueeze(2).to(DEVICE)  # (1, 3, 1, 384, 384)
     
     # Auto-cast for efficiency, but ensure input dtype matches encoder
@@ -230,19 +252,43 @@ def encode_all_frames(frames: list[Image.Image]) -> list[torch.Tensor]:
     return embeddings
 
 
-def load_sd_components_cached(sd_ckpt_path: Path):
-    """Load SD components with persistent caching."""
-    # Check if already cached and path matches
-    if (_model_cache["sd_components"] is not None and 
-        _model_cache["ckpt_hash"] == str(sd_ckpt_path)):
-        # Move back to GPU if needed
+SCHEDULER_OPTIONS = ["LCM+LoRA", "DDIM", "Euler A", "PNDM", "DPM++ 2M"]
+
+def build_scheduler(name: str, config):
+    """Instantiate the requested scheduler from a diffusers config dict."""
+    from diffusers import (DDIMScheduler, LCMScheduler,
+                           EulerAncestralDiscreteScheduler,
+                           PNDMScheduler, DPMSolverMultistepScheduler)
+    mapping = {
+        "DDIM":       lambda c: DDIMScheduler.from_config(c),
+        "LCM+LoRA":   lambda c: LCMScheduler.from_config(c),
+        "Euler A":    lambda c: EulerAncestralDiscreteScheduler.from_config(c),
+        "PNDM":       lambda c: PNDMScheduler.from_config(c),
+        "DPM++ 2M":   lambda c: DPMSolverMultistepScheduler.from_config(c),
+    }
+    return mapping.get(name, mapping["DDIM"])(config)
+
+
+def load_sd_components_cached(sd_ckpt_path: Path, scheduler_name: str = "DDIM"):
+    """Load SD components with persistent caching. Scheduler is rebuilt on name change."""
+    cached = _model_cache["sd_components"]
+    ckpt_match = _model_cache["ckpt_hash"] == str(sd_ckpt_path)
+
+    scheduler_match = _model_cache.get("scheduler_name") == scheduler_name
+
+    if cached is not None and ckpt_match and scheduler_match:
+        # Same checkpoint + same scheduler: just restore to GPU and reuse
         for key in ["vae", "unet", "text_enc"]:
-            if _model_cache["sd_components"][key]:
-                _model_cache["sd_components"][key].to(DEVICE)
-        return _model_cache["sd_components"]
-    
-    from safetensors.torch import load_file
-    from diffusers import StableDiffusionPipeline, DDIMScheduler, LCMScheduler
+            if cached[key]:
+                cached[key].to(DEVICE)
+        return cached
+
+    if cached is not None and not scheduler_match:
+        # Scheduler changed: full reload so LCM LoRA fusing etc. is always clean
+        print(f"Scheduler changed ({_model_cache.get('scheduler_name')} -> {scheduler_name}), reloading SD weights...")
+        clear_cache("sd")
+
+    from diffusers import StableDiffusionPipeline
 
     print(f"Loading SD checkpoint: {sd_ckpt_path.name}...")
     pipe = StableDiffusionPipeline.from_single_file(
@@ -252,31 +298,34 @@ def load_sd_components_cached(sd_ckpt_path: Path):
         load_safety_checker=False,
     ).to(DEVICE)
 
-    scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    # For LCM+LoRA: fuse LoRA while we still have the full pipe object
+    if scheduler_name == "LCM+LoRA":
+        print("Loading LCM LoRA weights and fusing…")
+        try:
+            pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
+            pipe.fuse_lora()
+            print("✓ LCM LoRA fused.")
+        except Exception as e:
+            print(f"⚠  LCM LoRA loading failed ({e}); continuing without LoRA.")
 
-    # # If Using LCMScheduler
-    # scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    # # Load LCM LoRA weights and fuse
-    # pipe.load_lora_weights("latent-consistency/lcm-lora-sdv1-5") 
-    # pipe.fuse_lora()
-
+    scheduler = build_scheduler(scheduler_name, pipe.scheduler.config)
     vae, unet, tokenizer, text_enc = pipe.vae.eval(), pipe.unet.eval(), pipe.tokenizer, pipe.text_encoder.eval()
-    
+
     for model in [vae, unet, text_enc]:
         for p in model.parameters():
             p.requires_grad_(False)
-    
+
     del pipe
     gc.collect()
     torch.cuda.empty_cache()
-    
-    # Cache components
+
     _model_cache["sd_components"] = {
-        "vae": vae, "unet": unet, "tokenizer": tokenizer, 
-        "text_enc": text_enc, "scheduler": scheduler
+        "vae": vae, "unet": unet, "tokenizer": tokenizer,
+        "text_enc": text_enc, "scheduler": scheduler,
     }
     _model_cache["ckpt_hash"] = str(sd_ckpt_path)
-    print("✓ SD components loaded and cached.")
+    _model_cache["scheduler_name"] = scheduler_name
+    print(f"✓ SD components loaded and cached. Scheduler: {scheduler_name}")
     return _model_cache["sd_components"]
 
 
@@ -496,11 +545,21 @@ def run_pipeline(
     seed: int = 42,
     conditioning_scale: float = 1.0,
     video_sample_fps: float = 0,  # 0 = use original fps
+    crop_mode: str = "center_crop",   # "center_crop" | "letterbox"
+    scheduler_name: str = "DDIM",
     log_fn=print,
     progress_fn=None,
 ):
     input_path = Path(input_path)
     is_video = input_path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+    # ── 0. Apply crop mode globally ──────────────────────────────
+    global vjepa_transform, _current_crop_mode
+    if crop_mode != _current_crop_mode:
+        log_fn(f"🔄 Crop mode → {crop_mode}")
+        vjepa_transform = _make_vjepa_transform(crop_mode)
+        _current_crop_mode = crop_mode
+    log_fn(f"🖼  Crop mode: {crop_mode} | Scheduler: {scheduler_name}")
 
     # ── 1. Load/extract frames ───────────────────────────────────
     if is_video:
@@ -522,7 +581,7 @@ def run_pipeline(
         progress_fn(0.3, "Loading models...")
 
     # ── 3. Load cached models ────────────────────────────────────
-    sd = load_sd_components_cached(SD_CKPT)
+    sd = load_sd_components_cached(SD_CKPT, scheduler_name)
     adapter = load_adapter_cached(ADAPTER_CKPT)
     vae, unet, tokenizer, text_enc, scheduler = [sd[k] for k in ["vae", "unet", "tokenizer", "text_enc", "scheduler"]]
 
@@ -633,23 +692,6 @@ class ModernApp(tk.Tk):
         self.file_info = ttk.Label(file_card, text="", style="Status.TLabel", wraplength=650)
         self.file_info.pack(fill="x", pady=(4, 0))
 
-        # ── Prompt Card ─────────────────────────────────────────
-        prompt_card = ttk.LabelFrame(main_frame, text="✏️ Prompt & Conditioning", padding=10)
-        prompt_card.pack(fill="x", pady=(0, 8))
-        
-        ttk.Label(prompt_card, text="Prompt (empty = null conditioning):").pack(anchor="w")
-        self.prompt_var = tk.StringVar()
-        prompt_entry = ttk.Entry(prompt_card, textvariable=self.prompt_var, width=70)
-        prompt_entry.pack(fill="x", pady=(2, 8))
-        
-        # Quick prompts
-        quick_frame = ttk.Frame(prompt_card)
-        quick_frame.pack(fill="x")
-        ttk.Label(quick_frame, text="Quick prompts:", style="Status.TLabel").pack(side="left")
-        for p in ["", "a photo of", "cinematic, detailed", "anime style"]:
-            ttk.Button(quick_frame, text=f"「{p}」" if p else "「clear」", 
-                      command=lambda x=p: self.prompt_var.set(x), width=14).pack(side="left", padx=2)
-
         # ── Settings Card ───────────────────────────────────────
         settings_card = ttk.LabelFrame(main_frame, text="⚙️ Generation Settings", padding=10)
         settings_card.pack(fill="x", pady=(0, 8))
@@ -682,7 +724,7 @@ class ModernApp(tk.Tk):
         
         # Row 2: Video FPS Sampling (only relevant for videos)
         ttk.Label(settings_grid, text="Video Sample FPS:").grid(row=2, column=0, sticky="w", pady=(8, 2))
-        self.fps_var = tk.DoubleVar(value=0.0)
+        self.fps_var = tk.DoubleVar(value=5.0)
         # Fixed: removed invalid 'tooltip' parameter
         fps_spin = ttk.Spinbox(settings_grid, from_=0, to=60, increment=1,
                             textvariable=self.fps_var, width=8)
@@ -690,6 +732,34 @@ class ModernApp(tk.Tk):
         # Added helper label instead of tooltip
         ttk.Label(settings_grid, text="(0=original, 1+=downsample)", 
                 style="Status.TLabel", foreground="#aaaaaa").grid(row=2, column=2, columnspan=2, sticky="w")
+
+        # Row 3: Crop Mode toggle
+        ttk.Label(settings_grid, text="Crop Mode:").grid(row=3, column=0, sticky="w", pady=(8, 2))
+        self.crop_mode_var = tk.StringVar(value="center_crop")
+        crop_frame = ttk.Frame(settings_grid)
+        crop_frame.grid(row=3, column=1, columnspan=3, sticky="w", pady=(8, 2))
+        self._crop_btn_center = ttk.Button(
+            crop_frame, text="⬛ Center Crop", width=14,
+            command=lambda: self._set_crop_mode("center_crop"))
+        self._crop_btn_center.pack(side="left", padx=(0, 4))
+        self._crop_btn_letter = ttk.Button(
+            crop_frame, text="⬜ Letterbox", width=14,
+            command=lambda: self._set_crop_mode("letterbox"))
+        self._crop_btn_letter.pack(side="left")
+        self._crop_mode_label = ttk.Label(crop_frame, text="● Center Crop active",
+                                          style="Status.TLabel", foreground="#5aa9e6")
+        self._crop_mode_label.pack(side="left", padx=(10, 0))
+
+        # Row 4: Scheduler selector
+        ttk.Label(settings_grid, text="Scheduler:").grid(row=4, column=0, sticky="w", pady=(6, 2))
+        self.scheduler_var = tk.StringVar(value="DDIM")
+        scheduler_combo = ttk.Combobox(
+            settings_grid, textvariable=self.scheduler_var,
+            values=SCHEDULER_OPTIONS, state="readonly", width=16)
+        scheduler_combo.grid(row=4, column=1, sticky="w", pady=(6, 2))
+        ttk.Label(settings_grid, text="⚠ Cache cleared on scheduler switch to LCM+LoRA",
+                  style="Status.TLabel", foreground="#aaaaaa").grid(
+                  row=4, column=2, columnspan=2, sticky="w")
 
         # ── Progress Section ────────────────────────────────────
         progress_card = ttk.Frame(main_frame)
@@ -730,6 +800,14 @@ class ModernApp(tk.Tk):
         
         # Bind Ctrl+A for select all in log
         self.log_text.bind("<Control-a>", lambda e: self.log_text.tag_add("sel", "1.0", "end"))
+
+    def _set_crop_mode(self, mode: str):
+        """Toggle crop mode and update button labels."""
+        self.crop_mode_var.set(mode)
+        if mode == "center_crop":
+            self._crop_mode_label.config(text="● Center Crop active", foreground="#5aa9e6")
+        else:
+            self._crop_mode_label.config(text="● Letterbox active", foreground="#e6a85a")
 
     def _browse(self):
         """Open file browser."""
@@ -807,12 +885,14 @@ class ModernApp(tk.Tk):
             try:
                 out = run_pipeline(
                     input_path=path,
-                    prompt=self.prompt_var.get(),
+                    prompt="",
                     cfg_scale=self.cfg_var.get(),
                     num_steps=self.steps_var.get(),
                     seed=self.seed_var.get(),
                     conditioning_scale=self.cond_scale_var.get(),
                     video_sample_fps=self.fps_var.get(),
+                    crop_mode=self.crop_mode_var.get(),
+                    scheduler_name=self.scheduler_var.get(),
                     log_fn=self._log,
                     progress_fn=self._update_progress,
                 )
