@@ -273,6 +273,8 @@ class WorldModelGame:
         self.is_recording   = False
         self.record_dir     = "temp_recording"
         self.frame_count    = 0
+        self.emb_buffer     = []
+        self.emb_frame_count = 0
         self.intensity      = 1.0
         self.latent_history = None
         self.is_running     = False
@@ -314,6 +316,28 @@ class WorldModelGame:
 
         self.rec_btn = self._btn(sidebar, "⏺ Start Recording", self._toggle_recording, color=ACCENT)
         self.rec_btn.pack(fill='x', pady=5, **P)
+
+        # Embedding capture controls
+        emb_row = tk.Frame(sidebar, bg=PANEL)
+        emb_row.pack(fill='x', padx=12, pady=(2, 0))
+        self.save_emb_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            emb_row, text="Also save embeddings", variable=self.save_emb_var,
+            bg=PANEL, fg=DIM, selectcolor=CARD, activebackground=PANEL,
+            activeforeground=BRIGHT, font=('Arial', 9),
+            highlightthickness=0,
+        ).pack(side='left')
+
+        stride_row = tk.Frame(sidebar, bg=PANEL)
+        stride_row.pack(fill='x', padx=12, pady=(0, 4))
+        tk.Label(stride_row, text="Every Nth emb:", bg=PANEL, fg=DIM,
+                 font=('Arial', 9)).pack(side='left')
+        self.emb_stride_var = tk.IntVar(value=1)
+        tk.Spinbox(
+            stride_row, from_=1, to=64, textvariable=self.emb_stride_var,
+            width=4, bg=CARD, fg=BRIGHT, buttonbackground=CARD,
+            relief='flat', font=('Arial', 9), justify='center',
+        ).pack(side='right')
 
         self._sep(sidebar)
         tk.Label(sidebar, text="Movement intensity",
@@ -405,11 +429,15 @@ class WorldModelGame:
             if os.path.exists(self.record_dir):
                 shutil.rmtree(self.record_dir)
             os.makedirs(self.record_dir)
-            self.is_recording = True
-            self.frame_count  = 0
+            self.is_recording    = True
+            self.frame_count     = 0
+            self.emb_buffer      = []
+            self.emb_frame_count = 0
             self.rec_btn.configure(text="⏹ Stop & Save", fg=DANGER)
         else:
             self.is_recording = False
+            self._save_emb_snapshot = self.save_emb_var.get()
+            self._emb_stride_snapshot = self.emb_stride_var.get()
             self.rec_btn.configure(text="... Processing ...", state='disabled')
             threading.Thread(target=self._finalize_video, daemon=True).start()
 
@@ -427,6 +455,18 @@ class WorldModelGame:
             print(f"Video saved: {output_file}")
         except Exception as e:
             print(f"FFmpeg error: {e}")
+
+        if getattr(self, '_save_emb_snapshot', False) and self.emb_buffer:
+            emb_file = f"output/embeddings_{timestamp}.npz"
+            try:
+                stacked = np.concatenate(self.emb_buffer, axis=0)  # [N, 144, 1024]
+                stride  = getattr(self, '_emb_stride_snapshot', 1)
+                np.savez_compressed(emb_file, embeddings=stacked, stride=np.array(stride))
+                print(f"Embeddings saved: {emb_file}  shape={stacked.shape}  stride={stride}")
+            except Exception as e:
+                print(f"Embedding save error: {e}")
+        self.emb_buffer = []
+
         shutil.rmtree(self.record_dir)
         self.root.after(0, lambda: self.rec_btn.configure(
             text="⏺ Start Recording", fg=ACCENT, state='normal'))
@@ -481,6 +521,13 @@ class WorldModelGame:
         if self.is_recording:
             pil.save(os.path.join(self.record_dir, f"frame_{self.frame_count:05d}.png"))
             self.frame_count += 1
+            if self.save_emb_var.get():
+                stride = max(1, self.emb_stride_var.get())
+                if self.emb_frame_count % stride == 0:
+                    self.emb_buffer.append(
+                        nxt.squeeze(1).cpu().float().numpy()  # [1, 144, 1024]
+                    )
+                self.emb_frame_count += 1
 
         vw, vh = self.main_area.winfo_width(), self.main_area.winfo_height()
         scale  = min(vw / 384, vh / 384) * 0.9

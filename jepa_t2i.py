@@ -752,7 +752,7 @@ class ModernApp(tk.Tk):
 
         # Row 4: Scheduler selector
         ttk.Label(settings_grid, text="Scheduler:").grid(row=4, column=0, sticky="w", pady=(6, 2))
-        self.scheduler_var = tk.StringVar(value="DDIM")
+        self.scheduler_var = tk.StringVar(value="LCM+LoRA")
         scheduler_combo = ttk.Combobox(
             settings_grid, textvariable=self.scheduler_var,
             values=SCHEDULER_OPTIONS, state="readonly", width=16)
