@@ -6,6 +6,8 @@ ckpts
 __pycache__
 *.log
 *.pt
+*.pth
+*.ipynb
 
 
 experiments
