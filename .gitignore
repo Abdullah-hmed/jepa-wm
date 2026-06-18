@@ -1,12 +1,14 @@
 output
 notebooks
 ckpts
+inference_out
 .venv
 
 __pycache__
 *.log
 *.pt
 *.pth
+*.safetensors
 *.ipynb
 
 
